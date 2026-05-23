@@ -1,0 +1,30 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "InfraredCollector.Core", "src\InfraredCollector.Core\InfraredCollector.Core.csproj", "{0D824A25-0447-4BF2-B04F-9E621ED2F131}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "InfraredCollector.Win", "src\InfraredCollector.Win\InfraredCollector.Win.csproj", "{910617E3-8E86-4195-9948-C5E75B7B52A8}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "InfraredCollector.Tests", "tests\InfraredCollector.Tests\InfraredCollector.Tests.csproj", "{29DA58A1-4322-4E2D-BBCB-6521707077A8}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{0D824A25-0447-4BF2-B04F-9E621ED2F131}.Debug|x64.ActiveCfg = Debug|x64
+		{0D824A25-0447-4BF2-B04F-9E621ED2F131}.Debug|x64.Build.0 = Debug|x64
+		{0D824A25-0447-4BF2-B04F-9E621ED2F131}.Release|x64.ActiveCfg = Release|x64
+		{0D824A25-0447-4BF2-B04F-9E621ED2F131}.Release|x64.Build.0 = Release|x64
+		{910617E3-8E86-4195-9948-C5E75B7B52A8}.Debug|x64.ActiveCfg = Debug|x64
+		{910617E3-8E86-4195-9948-C5E75B7B52A8}.Debug|x64.Build.0 = Debug|x64
+		{910617E3-8E86-4195-9948-C5E75B7B52A8}.Release|x64.ActiveCfg = Release|x64
+		{910617E3-8E86-4195-9948-C5E75B7B52A8}.Release|x64.Build.0 = Release|x64
+		{29DA58A1-4322-4E2D-BBCB-6521707077A8}.Debug|x64.ActiveCfg = Debug|x64
+		{29DA58A1-4322-4E2D-BBCB-6521707077A8}.Debug|x64.Build.0 = Debug|x64
+		{29DA58A1-4322-4E2D-BBCB-6521707077A8}.Release|x64.ActiveCfg = Release|x64
+		{29DA58A1-4322-4E2D-BBCB-6521707077A8}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+EndGlobal

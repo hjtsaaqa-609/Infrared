@@ -1,0 +1,60 @@
+.DS_Store
+
+# Local Python/macOS environment
+.venv-macos/
+__pycache__/
+*.pyc
+
+# Build outputs
+bin/
+obj/
+src/**/bin/
+src/**/obj/
+tests/**/bin/
+tests/**/obj/
+native/**/build/
+native/**/x64/
+src/InfraredCollector.Win/NativeBinaries/*.dll
+
+# Capture data and temporary working files
+captures/
+tmp/
+test/
+20[0-9][0-9][0-9][0-9][0-9][0-9]_*/
+*.tar.gz
+*.suo
+*.ncb
+*.opt
+*.plg
+*.APS
+*.log
+.vs/
+Debug/
+Release/
+
+# Old generated packages; current archived package is under archive/
+*.zip
+!archive/*.zip
+
+# Full third-party GUI drops duplicated from vendor/ and docs archives
+docs/EnviromentalTester/
+docs/USB2UARTPSIIICV3.1.2(20260414)/USB2UARTPSIIICV3.1.2/例程/
+docs/USB2UARTPSIIICV3.1.2(20260414)/USB2UARTPSIIICV3.1.2/调试软件/
+docs/USB2UARTPSIIICV3.1.2(20260414)/USB2UARTPSIIICV3.1.2/数据可视化/
+vendor/tasi/EnviromentalTester/audio/
+vendor/tasi/EnviromentalTester/bearer/
+vendor/tasi/EnviromentalTester/iconengines/
+vendor/tasi/EnviromentalTester/imageformats/
+vendor/tasi/EnviromentalTester/mediaservice/
+vendor/tasi/EnviromentalTester/platforms/
+vendor/tasi/EnviromentalTester/playlistformats/
+vendor/tasi/EnviromentalTester/printsupport/
+vendor/tasi/EnviromentalTester/styles/
+vendor/tasi/EnviromentalTester/translations/
+vendor/tasi/EnviromentalTester/*.pdb
+vendor/tasi/EnviromentalTester/Qt5*.dll
+vendor/tasi/EnviromentalTester/D3Dcompiler_47.dll
+vendor/tasi/EnviromentalTester/lib*.dll
+vendor/tasi/EnviromentalTester/opengl32sw.dll
+vendor/tasi/EnviromentalTester/EnvironmentalTester.exe
+vendor/tasi/EnviromentalTester/qt.conf

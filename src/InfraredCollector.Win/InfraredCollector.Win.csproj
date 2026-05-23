@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>InfraredCollector.Win</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\InfraredCollector.Core\InfraredCollector.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\vendor\usb2uart\USB2UARTSPIIICDLL.dll" Link="USB2UARTSPIIICDLL.dll" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\vendor\tasi\EnviromentalTester\hidapi.dll" Link="hidapi.dll" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\appsettings.example.json" Link="appsettings.example.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="NativeBinaries\Mlx90640Native.dll" Link="Mlx90640Native.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('NativeBinaries\Mlx90640Native.dll')" />
+  </ItemGroup>
+</Project>

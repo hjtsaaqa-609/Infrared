@@ -1,0 +1,11 @@
+1.拷贝动态库到usr/local/lib 文件夹下。需要管理员管理员权限
+sudo cp libUSB2UARTSPIIIC.so /usr/local/lib
+3.刷新一下动态链接库的配置
+sudo ldconfig
+4.lsusb查看USB端口号
+例如：Bus 002 Device 006: ID 0483:5740 STMicroelectronics STM32F407
+4.打开USB读写权限
+sudo chmod 666 /dev/bus/usb/002/006
+5.接下来就可以调用libUSB2UARTSPIIIC.so开发您自己的称程序了
+6.GCC编译命令举例：
+g++ -o main main.cpp -L./ -lUSB2UARTSPIIIC -lpthread
