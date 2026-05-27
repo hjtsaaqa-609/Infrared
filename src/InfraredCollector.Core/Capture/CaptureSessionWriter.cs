@@ -37,7 +37,7 @@ public sealed class CaptureSessionWriter : IDisposable
             JsonSerializer.Serialize(
                 new
                 {
-                    createdUtc = DateTimeOffset.UtcNow,
+                    createdEast8 = East8Clock.Now(),
                     kind = "win_dual_mlx_tasi",
                     config,
                     sessionMetadata,
@@ -50,7 +50,7 @@ public sealed class CaptureSessionWriter : IDisposable
         _tasiRawWriter = OpenBinary(Path.Combine(RawDirectory, "tasi_serial_frames.bin"));
 
         _tasiCsv.WriteLine(Csv.Row(
-            "timestamp_utc",
+            "timestamp_east8",
             "raw_offset_bytes",
             "frame_length",
             "command",
@@ -64,7 +64,7 @@ public sealed class CaptureSessionWriter : IDisposable
             "raw_hex"));
         _joinedCsv.WriteLine(Csv.Row(
             "mlx_channel",
-            "mlx_timestamp_utc",
+            "mlx_timestamp_east8",
             "mlx_subpage",
             "mlx_to_offset_bytes",
             "mlx_robot_thermal_u8_offset_bytes",
@@ -73,7 +73,7 @@ public sealed class CaptureSessionWriter : IDisposable
             "mlx_max_c",
             "mlx_avg_c",
             "mlx_center_c",
-            "tasi_timestamp_utc",
+            "tasi_timestamp_east8",
             "tasi_age_ms",
             "tasi_channel1_c",
             "tasi_channel2_c",
@@ -135,10 +135,11 @@ public sealed class CaptureSessionWriter : IDisposable
             }
             writer.Flush();
 
-            var record = new MlxSubpageRecord(timestampUtc, safe, usbIndex, boardUid, subPage, status, control, polls, statusAfterClear, statusClearMethod, subPageSource, offset, frameData.Length);
+            var timestampEast8 = East8Clock.ToEast8(timestampUtc);
+            var record = new MlxSubpageRecord(timestampEast8, safe, usbIndex, boardUid, subPage, status, control, polls, statusAfterClear, statusClearMethod, subPageSource, offset, frameData.Length);
             var csv = GetSubpageCsv(safe);
             csv.WriteLine(Csv.Row(
-                timestampUtc.ToString("O"), subPage,
+                East8Clock.Format(timestampEast8), subPage,
                 $"0x{status:X4}", $"0x{control:X4}", polls, $"0x{statusAfterClear:X4}", statusClearMethod, subPageSource, offset, frameData.Length));
             csv.Flush();
             return record;
@@ -164,10 +165,11 @@ public sealed class CaptureSessionWriter : IDisposable
             robotWriter.Flush();
             File.WriteAllBytes(Path.Combine(TemperatureDirectory, $"{safe}_infrared_thermal_latest.bin"), robotBytes);
 
-            var summary = Summarize(timestampUtc, safe, usbIndex, boardUid, subPage, temperatureOffset, ambientTemperature, temperature, robotOffset, robotBytes.Length);
+            var timestampEast8 = East8Clock.ToEast8(timestampUtc);
+            var summary = Summarize(timestampEast8, safe, usbIndex, boardUid, subPage, temperatureOffset, ambientTemperature, temperature, robotOffset, robotBytes.Length);
             var csv = GetFrameCsv(safe);
             csv.WriteLine(Csv.Row(
-                timestampUtc.ToString("O"),
+                East8Clock.Format(timestampEast8),
                 subPage,
                 summary.TemperatureOffsetBytes,
                 summary.RobotThermalOffsetBytes,
@@ -193,8 +195,9 @@ public sealed class CaptureSessionWriter : IDisposable
             _tasiRawWriter.Write(raw);
             _tasiRawWriter.Flush();
 
+            var timestampEast8 = East8Clock.ToEast8(timestampUtc);
             var record = new TasiSerialRecord(
-                timestampUtc,
+                timestampEast8,
                 offset,
                 raw.Length,
                 parsed.Command,
@@ -206,7 +209,7 @@ public sealed class CaptureSessionWriter : IDisposable
             _latestTasi = record;
 
             _tasiCsv.WriteLine(Csv.Row(
-                timestampUtc.ToString("O"),
+                East8Clock.Format(timestampEast8),
                 offset,
                 raw.Length,
                 $"0x{parsed.Command:X2}",
@@ -233,7 +236,7 @@ public sealed class CaptureSessionWriter : IDisposable
             _tasiHidRawWriter.Flush();
 
             var raw = Convert.ToHexString(report.AsSpan(0, reportLength)).ToLowerInvariant();
-            return new TasiRawRecord(timestampUtc, offset, reportLength, raw, "raw_hid_unparsed");
+            return new TasiRawRecord(East8Clock.ToEast8(timestampUtc), offset, reportLength, raw, "raw_hid_unparsed");
         }
     }
 
@@ -296,7 +299,7 @@ public sealed class CaptureSessionWriter : IDisposable
         if (!_subpageCsvWriters.TryGetValue(channel, out var writer)) {
             writer = OpenCsvInSession($"{channel}_mlx_subpages.csv");
             writer.WriteLine(Csv.Row(
-                "timestamp_utc",
+                "timestamp_east8",
                 "subpage",
                 "status_register_hex",
                 "control_register_hex",
@@ -316,7 +319,7 @@ public sealed class CaptureSessionWriter : IDisposable
         if (!_frameCsvWriters.TryGetValue(channel, out var writer)) {
             writer = OpenCsvInSession($"{channel}_mlx_frames.csv");
             writer.WriteLine(Csv.Row(
-                "timestamp_utc",
+                "timestamp_east8",
                 "subpage",
                 "to_offset_bytes",
                 "robot_thermal_u8_offset_bytes",
@@ -365,7 +368,7 @@ public sealed class CaptureSessionWriter : IDisposable
         var ageMs = tasi is null ? null : (double?)(summary.TimestampUtc - tasi.TimestampUtc).TotalMilliseconds;
         _joinedCsv.WriteLine(Csv.Row(
             summary.Channel,
-            summary.TimestampUtc.ToString("O"),
+            East8Clock.Format(summary.TimestampUtc),
             summary.SubPage,
             summary.TemperatureOffsetBytes,
             summary.RobotThermalOffsetBytes,
@@ -374,7 +377,7 @@ public sealed class CaptureSessionWriter : IDisposable
             summary.Max,
             summary.Average,
             summary.Center,
-            tasi?.TimestampUtc.ToString("O"),
+            tasi is null ? null : East8Clock.Format(tasi.TimestampUtc),
             ageMs,
             ChannelValue(tasi?.ChannelsC, 0),
             ChannelValue(tasi?.ChannelsC, 1),

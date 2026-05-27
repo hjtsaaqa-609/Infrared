@@ -1,4 +1,5 @@
 using System.IO.Ports;
+using InfraredCollector.Core.Util;
 
 namespace InfraredCollector.Core.Capture;
 
@@ -54,15 +55,15 @@ public sealed class TasiSerialRecorder
             Thread.Sleep(100);
             port.DiscardInBuffer();
             WriteCommand(port, TasiSerialProtocol.StartRealtimeCommand);
-            var lastCommand = DateTimeOffset.UtcNow;
+            var lastCommand = East8Clock.Now();
             Status?.Invoke(this, $"TA612 serial: opened {_portName} @ {_baudRate}");
 
             var readBuffer = new byte[_readSize];
             var frameBuffer = new List<byte>(_readSize * 2);
             while (!cancellationToken.IsCancellationRequested) {
-                if (DateTimeOffset.UtcNow - lastCommand >= _pollInterval) {
+                if (East8Clock.Now() - lastCommand >= _pollInterval) {
                     WriteCommand(port, TasiSerialProtocol.StartRealtimeCommand);
-                    lastCommand = DateTimeOffset.UtcNow;
+                    lastCommand = East8Clock.Now();
                 }
 
                 var read = 0;
@@ -82,7 +83,7 @@ public sealed class TasiSerialRecorder
 
                 while (TasiSerialProtocol.TryReadFrame(frameBuffer, out var raw)) {
                     var parsed = TasiSerialProtocol.Parse(raw);
-                    var record = _writer.WriteTasiSerialFrame(DateTimeOffset.UtcNow, raw, parsed);
+                    var record = _writer.WriteTasiSerialFrame(East8Clock.Now(), raw, parsed);
                     FrameCaptured?.Invoke(this, record);
                 }
             }

@@ -33,18 +33,32 @@ class MacosInfraredCliTests(unittest.TestCase):
         self.assertEqual(command, bytes.fromhex("09 00 0E 01 01 00 05 00 00 66 80 0D 19 00"))
 
     def test_refresh_rate_bits(self):
-        self.assertEqual(cli.with_refresh_rate(0x0000, 6), 0x0300)
-        self.assertEqual(cli.refresh_rate(0x0300), 6)
-        self.assertEqual(cli.with_refresh_rate(0xFFFF, 6), 0xFFFF & ~0x0380 | 0x0300)
+        self.assertEqual(cli.with_refresh_rate(0x0000, 4), 0x0200)
+        self.assertEqual(cli.refresh_rate(0x0200), 4)
+        self.assertEqual(cli.with_refresh_rate(0xFFFF, 4), 0xFFFF & ~0x0380 | 0x0200)
+
+    def test_refresh_rate_hz_parser(self):
+        self.assertEqual(cli.parse_refresh_rate_hz("8"), 8.0)
+        self.assertEqual(cli.refresh_rate_bits_from_hz(8.0), cli.REFRESH_RATE_8HZ)
+        self.assertEqual(cli.refresh_rate_bits_from_hz(32.0), cli.REFRESH_RATE_32HZ)
+        with self.assertRaises(cli.argparse.ArgumentTypeError):
+            cli.parse_refresh_rate_hz("12")
+
+    def test_full_frame_gate_emits_only_after_both_subpages(self):
+        gate = cli.MlxFullFrameGate()
+
+        decisions = [gate.should_emit(subpage) for subpage in [0, 0, 1, 1, 0, 1]]
+
+        self.assertEqual(decisions, [False, False, True, False, True, True])
 
     def test_verified_driver_control_bits(self):
         control = 0
         control = cli.with_chess_mode(control)
         control = cli.with_resolution(control, cli.RESOLUTION_18BIT)
-        control = cli.with_refresh_rate(control, cli.REFRESH_RATE_32HZ)
-        self.assertEqual(control, 0x1B00)
+        control = cli.with_refresh_rate(control, cli.REFRESH_RATE_8HZ)
+        self.assertEqual(control, 0x1A00)
         self.assertEqual(cli.resolution(control), 2)
-        self.assertEqual(cli.refresh_rate(control), 6)
+        self.assertEqual(cli.refresh_rate(control), 4)
         self.assertTrue(control & cli.CHESS_MODE_MASK)
 
     def test_default_read_mode_uses_atomic_usb2uart_register_command(self):
@@ -89,6 +103,47 @@ class MacosInfraredCliTests(unittest.TestCase):
         )
         self.assertEqual(len(words), 10)
 
+    def test_i2c_read_stats_track_responses_and_failures(self):
+        bus = cli.Usb2UartSerialI2c("dummy")
+
+        def successful_write(command, response_len=0, response_timeout=None):
+            return b"\x12\x34"
+
+        bus._write = successful_write
+        self.assertEqual(bus.read_register_bytes(0x33, cli.STATUS_REGISTER, 2), b"\x12\x34")
+        self.assertEqual(bus.i2c_stats.read_requests, 1)
+        self.assertEqual(bus.i2c_stats.read_responses, 1)
+        self.assertEqual(bus.i2c_stats.read_failures, 0)
+        self.assertEqual(bus.i2c_stats.response_bytes, 2)
+        self.assertEqual(bus.i2c_stats.pending_reads, 0)
+
+        def failing_write(command, response_len=0, response_timeout=None):
+            raise cli.CliError("timeout")
+
+        bus._write = failing_write
+        with self.assertRaises(cli.CliError):
+            bus.read_register_bytes(0x33, cli.STATUS_REGISTER, 2)
+        self.assertEqual(bus.i2c_stats.read_requests, 2)
+        self.assertEqual(bus.i2c_stats.read_responses, 1)
+        self.assertEqual(bus.i2c_stats.read_failures, 1)
+        self.assertEqual(bus.i2c_stats.pending_reads, 0)
+
+    def test_capture_writer_saves_i2c_event_stats(self):
+        with TemporaryDirectory() as tmp:
+            stats = cli.I2cEventStats()
+            stats.record_read_request()
+            stats.record_read_response(2)
+
+            with cli.MlxCaptureWriter(Path(tmp), {"kind": "test"}, [0x1234]) as writer:
+                session_dir = writer.session_dir
+                writer.write_i2c_stats(stats)
+                entries = writer.file_entries()
+
+            self.assertEqual(entries["i2cEventsJson"], "raw/i2c_events.json")
+            i2c_text = (session_dir / "raw" / "i2c_events.json").read_text(encoding="utf-8")
+            self.assertIn('"i2cReadRequests": 1', i2c_text)
+            self.assertIn('"i2cReadResponses": 1', i2c_text)
+
     def test_capture_writer_saves_eeprom_raw_files(self):
         with TemporaryDirectory() as tmp:
             eeprom = [0x1234, 0xABCD, 0x0001]
@@ -114,7 +169,7 @@ class MacosInfraredCliTests(unittest.TestCase):
             pixels = [28.0 + (index / 100.0) for index in range(cli.PIXEL_WORDS)]
             with cli.MlxCaptureWriter(Path(tmp), {"kind": "test"}, [0x1234]) as writer:
                 session_dir = writer.session_dir
-                writer.write_frame(cli.utc_now(), 1, 24.0, pixels)
+                writer.write_frame(cli.east8_now(), 1, 24.0, pixels)
 
             robot_bin = session_dir / "temp" / "mlx90640_infrared_thermal.bin"
             latest_bin = session_dir / "temp" / "mlx90640_infrared_thermal_latest.bin"
@@ -138,7 +193,7 @@ class MacosInfraredCliTests(unittest.TestCase):
                 channel="left",
                 write_session_json=False,
             ) as writer:
-                summary = writer.write_frame(cli.utc_now(), 1, 24.0, pixels)
+                summary = writer.write_frame(cli.east8_now(), 1, 24.0, pixels)
                 entries = writer.file_entries()
 
             self.assertEqual(summary.channel, "left")
@@ -240,7 +295,7 @@ class MacosInfraredCliTests(unittest.TestCase):
             frame_without_sum = bytes.fromhex("55 aa 01 0b fa 00 4c 01 fe 00 ff 00")
             raw = frame_without_sum + bytes([sum(frame_without_sum) & 0xFF])
             parsed = cli.parse_tasi_frame(raw)
-            timestamp = cli.utc_now()
+            timestamp = cli.east8_now()
 
             with cli.TasiSerialCaptureWriter(session_dir) as tasi_writer:
                 sample = tasi_writer.write_frame(timestamp, raw, parsed)
@@ -255,14 +310,14 @@ class MacosInfraredCliTests(unittest.TestCase):
     def test_joined_summary_can_include_mlx_channel(self):
         with TemporaryDirectory() as tmp:
             session_dir = Path(tmp)
-            timestamp = cli.utc_now()
+            timestamp = cli.east8_now()
             mlx = cli.MlxFrameSummary(timestamp, 1, 0, 768, 30.0, 20.0, 40.0, 25.0, 26.0, channel="right")
 
             with cli.JoinedSummaryWriter(session_dir, include_mlx_channel=True) as joined:
                 joined.write(mlx, None)
 
             csv_text = (session_dir / "joined_summary.csv").read_text(encoding="utf-8")
-            self.assertTrue(csv_text.startswith("mlx_channel,mlx_timestamp_utc"))
+            self.assertTrue(csv_text.startswith("mlx_channel,mlx_timestamp_east8"))
             self.assertIn("right,", csv_text)
 
 

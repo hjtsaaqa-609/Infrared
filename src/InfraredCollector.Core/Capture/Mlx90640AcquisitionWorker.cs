@@ -49,7 +49,7 @@ public sealed class Mlx90640AcquisitionWorker
                 $"{_channel.Name}: EEPROM read and operating mode configured " +
                 $"(chess 0x{mode.Chess.Before:X4}->0x{mode.Chess.After:X4}, " +
                 $"18bit 0x{mode.Resolution.Before:X4}->0x{mode.Resolution.After:X4}, " +
-                $"32Hz 0x{mode.Refresh.Before:X4}->0x{mode.Refresh.After:X4}, " +
+                $"{mode.RefreshRateHz:g}Hz 0x{mode.Refresh.Before:X4}->0x{mode.Refresh.After:X4} bits={mode.RefreshRateBits}, " +
                 $"lowbits 0x{mode.LowBits.Before:X4}->0x{mode.LowBits.After:X4})");
 
             using var calculator = new Mlx90640Calculator();

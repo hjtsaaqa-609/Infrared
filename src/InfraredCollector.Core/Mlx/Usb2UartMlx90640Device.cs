@@ -1,5 +1,6 @@
 using InfraredCollector.Core.Configuration;
 using InfraredCollector.Core.Devices;
+using InfraredCollector.Core.Util;
 using System.Text;
 
 namespace InfraredCollector.Core.Mlx;
@@ -9,6 +10,8 @@ public sealed class Usb2UartMlx90640Device : IDisposable
     private readonly uint _usbIndex;
     private readonly byte _i2cAddress;
     private readonly int _chunkWords;
+    private readonly double _refreshRateHz;
+    private readonly byte _refreshRateBits;
     private bool _opened;
 
     public Usb2UartMlx90640Device(uint usbIndex, AppConfig config)
@@ -16,11 +19,14 @@ public sealed class Usb2UartMlx90640Device : IDisposable
         _usbIndex = usbIndex;
         _i2cAddress = config.MlxI2cAddress;
         _chunkWords = Math.Clamp(config.MlxReadChunkWords, 1, 128);
+        _refreshRateHz = config.MlxRefreshRateHz;
+        _refreshRateBits = Mlx90640Constants.RefreshRateBitsFromHz(_refreshRateHz);
         ClockStretchLevel = (uint)config.I2cClockStretchLevel;
     }
 
     public uint UsbIndex => _usbIndex;
     public uint ClockStretchLevel { get; }
+    public double RefreshRateHz => _refreshRateHz;
     public string BoardUid { get; private set; } = "";
 
     public void OpenAndConfigure()
@@ -115,9 +121,9 @@ public sealed class Usb2UartMlx90640Device : IDisposable
     {
         var chess = ConfigureChessMode();
         var resolution = ConfigureResolution18Bit();
-        var refresh = ConfigureRefreshRate32Hz();
+        var refresh = ConfigureRefreshRate();
         var lowBits = ConfigureMacVerifiedLowBits();
-        return new MlxOperatingModeResult(chess, resolution, refresh, lowBits);
+        return new MlxOperatingModeResult(chess, resolution, refresh, lowBits, _refreshRateHz, _refreshRateBits);
     }
 
     private MlxControlRegisterResult ConfigureChessMode()
@@ -159,19 +165,19 @@ public sealed class Usb2UartMlx90640Device : IDisposable
         return new MlxControlRegisterResult(current, updated, verify);
     }
 
-    private MlxControlRegisterResult ConfigureRefreshRate32Hz()
+    private MlxControlRegisterResult ConfigureRefreshRate()
     {
         var current = ReadWord(Mlx90640Constants.ControlRegister);
-        var updated = Mlx90640Registers.WithRefreshRate(current, Mlx90640Constants.RefreshRate32Hz);
+        var updated = Mlx90640Registers.WithRefreshRate(current, _refreshRateBits);
         if (updated != current) {
             WriteWord(Mlx90640Constants.ControlRegister, updated);
             Thread.Sleep(2);
         }
 
         var verify = ReadWord(Mlx90640Constants.ControlRegister);
-        if (Mlx90640Registers.RefreshRate(verify) != Mlx90640Constants.RefreshRate32Hz) {
+        if (Mlx90640Registers.RefreshRate(verify) != _refreshRateBits) {
             throw new InvalidOperationException(
-                $"Failed to set MLX90640 refresh rate to 32 Hz on USB index {_usbIndex}. " +
+                $"Failed to set MLX90640 refresh rate to {_refreshRateHz:g} Hz on USB index {_usbIndex}. " +
                 $"control before=0x{current:X4}, target=0x{updated:X4}, after=0x{verify:X4}, " +
                 $"after refresh bits={Mlx90640Registers.RefreshRate(verify)}.");
         }
@@ -217,7 +223,7 @@ public sealed class Usb2UartMlx90640Device : IDisposable
         var control = ReadWord(Mlx90640Constants.ControlRegister);
         var frameData = Mlx90640FrameData.Compose(pixels, aux, control, status);
 
-        return new MlxRawSubpage(DateTimeOffset.UtcNow, status, control, polls, clear.After, clear.Method, frameData);
+        return new MlxRawSubpage(East8Clock.Now(), status, control, polls, clear.After, clear.Method, frameData);
     }
 
     public void Dispose()
@@ -270,5 +276,11 @@ public sealed class Usb2UartMlx90640Device : IDisposable
 
 public sealed record MlxRawSubpage(DateTimeOffset TimestampUtc, ushort StatusRegister, ushort ControlRegister, int DataReadyPolls, ushort StatusAfterClear, string StatusClearMethod, ushort[] FrameData);
 public sealed record MlxControlRegisterResult(ushort Before, ushort Target, ushort After);
-public sealed record MlxOperatingModeResult(MlxControlRegisterResult Chess, MlxControlRegisterResult Resolution, MlxControlRegisterResult Refresh, MlxControlRegisterResult LowBits);
+public sealed record MlxOperatingModeResult(
+    MlxControlRegisterResult Chess,
+    MlxControlRegisterResult Resolution,
+    MlxControlRegisterResult Refresh,
+    MlxControlRegisterResult LowBits,
+    double RefreshRateHz,
+    byte RefreshRateBits);
 public sealed record MlxStatusClearResult(ushort Before, ushort After, string Method);

@@ -1,4 +1,5 @@
 using InfraredCollector.Core.Devices;
+using InfraredCollector.Core.Util;
 
 namespace InfraredCollector.Core.Capture;
 
@@ -45,7 +46,7 @@ public sealed class TasiHidRecorder
                 Array.Clear(buffer);
                 var read = HidApiNative.ReadTimeout(handle, buffer, (UIntPtr)buffer.Length, 250);
                 if (read > 0) {
-                    var record = _writer.WriteTasiRaw(DateTimeOffset.UtcNow, buffer, read);
+                    var record = _writer.WriteTasiRaw(East8Clock.Now(), buffer, read);
                     ReportCaptured?.Invoke(this, record);
                 }
                 else if (read < 0) {

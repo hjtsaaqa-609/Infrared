@@ -14,10 +14,28 @@ public static class Mlx90640Constants
     public const int FrameDataWords = 834;
     public const ushort DataReadyMask = 0x0008;
     public const ushort InitStatusValue = 0x0030;
+    public const double DefaultRefreshRateHz = 8.0;
+    public const byte RefreshRate8Hz = 4;
     public const byte RefreshRate32Hz = 6;
     public const byte Resolution18Bit = 2;
     public const ushort ChessModeMask = 0x1000;
     public const ushort ControlLowBitsMask = 0x000F;
     public const ushort ControlLowBitsMacVerified = 0x0001;
     public const uint IicRate1M = 11;
+
+    public static readonly double[] SupportedRefreshRatesHz = [0.5, 1, 2, 4, 8, 16, 32, 64];
+
+    public static byte RefreshRateBitsFromHz(double refreshRateHz)
+    {
+        for (var i = 0; i < SupportedRefreshRatesHz.Length; i++) {
+            if (Math.Abs(SupportedRefreshRatesHz[i] - refreshRateHz) < 0.001) {
+                return (byte)i;
+            }
+        }
+
+        throw new ArgumentOutOfRangeException(
+            nameof(refreshRateHz),
+            refreshRateHz,
+            "MLX90640 refresh rate must be one of: 0.5, 1, 2, 4, 8, 16, 32, 64 Hz.");
+    }
 }

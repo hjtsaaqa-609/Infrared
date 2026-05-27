@@ -1,6 +1,7 @@
 using InfraredCollector.Core.Capture;
 using InfraredCollector.Core.Configuration;
 using InfraredCollector.Core.Devices;
+using InfraredCollector.Core.Mlx;
 using System.Drawing;
 using System.IO.Ports;
 using System.Windows.Forms;
@@ -15,6 +16,7 @@ public sealed class MainForm : Form
     private readonly NumericUpDown _leftUsb = new();
     private readonly NumericUpDown _rightUsb = new();
     private readonly ComboBox _tasiPort = new();
+    private readonly ComboBox _mlxRefreshRate = new();
     private readonly NumericUpDown _tasiBaud = new();
     private readonly NumericUpDown _tasiPollMs = new();
     private readonly TextBox _captureRoot = new();
@@ -79,7 +81,7 @@ public sealed class MainForm : Form
 
     private Control BuildDevicePanel()
     {
-        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 12, ColumnCount = 2 };
+        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 13, ColumnCount = 2 };
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
 
@@ -110,23 +112,27 @@ public sealed class MainForm : Form
         panel.Controls.Add(_leftUsb, 0, 5);
         panel.Controls.Add(_rightUsb, 1, 5);
 
-        panel.Controls.Add(new Label { Text = "TA612 COM Port", AutoSize = true }, 0, 6);
+        panel.Controls.Add(new Label { Text = "MLX Refresh Hz", AutoSize = true }, 0, 6);
+        ConfigureRefreshRateCombo();
+        panel.Controls.Add(_mlxRefreshRate, 1, 6);
+
+        panel.Controls.Add(new Label { Text = "TA612 COM Port", AutoSize = true }, 0, 7);
         _tasiPort.Dock = DockStyle.Fill;
         _tasiPort.DropDownStyle = ComboBoxStyle.DropDown;
-        panel.Controls.Add(_tasiPort, 1, 6);
+        panel.Controls.Add(_tasiPort, 1, 7);
 
-        panel.Controls.Add(new Label { Text = "TA612 Baud", AutoSize = true }, 0, 7);
+        panel.Controls.Add(new Label { Text = "TA612 Baud", AutoSize = true }, 0, 8);
         ConfigureNumeric(_tasiBaud, _config.TasiBaudRate, 1200, 921600);
-        panel.Controls.Add(_tasiBaud, 1, 7);
+        panel.Controls.Add(_tasiBaud, 1, 8);
 
-        panel.Controls.Add(new Label { Text = "TA612 Poll ms", AutoSize = true }, 0, 8);
+        panel.Controls.Add(new Label { Text = "TA612 Poll ms", AutoSize = true }, 0, 9);
         ConfigureNumeric(_tasiPollMs, Math.Max(100, (int)Math.Round(_config.TasiPollIntervalSeconds * 1000)), 100, 60000);
-        panel.Controls.Add(_tasiPollMs, 1, 8);
+        panel.Controls.Add(_tasiPollMs, 1, 9);
 
         _captureRoot.Text = Path.GetFullPath(_config.CaptureRoot);
         _captureRoot.Dock = DockStyle.Fill;
-        panel.Controls.Add(new Label { Text = "Capture Root", AutoSize = true }, 0, 10);
-        panel.Controls.Add(_captureRoot, 1, 10);
+        panel.Controls.Add(new Label { Text = "Capture Root", AutoSize = true }, 0, 11);
+        panel.Controls.Add(_captureRoot, 1, 11);
 
         _startButton.Text = "Start";
         _startButton.Height = 36;
@@ -135,11 +141,11 @@ public sealed class MainForm : Form
         _stopButton.Height = 36;
         _stopButton.Enabled = false;
         _stopButton.Click += (_, _) => StopCapture();
-        panel.Controls.Add(_startButton, 0, 11);
-        panel.Controls.Add(_stopButton, 1, 11);
+        panel.Controls.Add(_startButton, 0, 12);
+        panel.Controls.Add(_stopButton, 1, 12);
 
         for (var i = 0; i < panel.RowCount; i++) {
-            panel.RowStyles.Add(i is 1 or 6 ? new RowStyle(SizeType.Percent, 50) : new RowStyle(SizeType.AutoSize));
+            panel.RowStyles.Add(i == 1 ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.AutoSize));
         }
 
         return panel;
@@ -227,6 +233,7 @@ public sealed class MainForm : Form
 
         try {
             _config.CaptureRoot = _captureRoot.Text;
+            _config.MlxRefreshRateHz = SelectedRefreshRateHz();
             _config.TasiSerialPort = _tasiPort.Text.Trim();
             _config.TasiBaudRate = (int)_tasiBaud.Value;
             _config.TasiPollIntervalSeconds = (double)_tasiPollMs.Value / 1000.0;
@@ -237,6 +244,7 @@ public sealed class MainForm : Form
             {
                 leftUsbIndex = (uint)_leftUsb.Value,
                 rightUsbIndex = (uint)_rightUsb.Value,
+                mlxRefreshRateHz = _config.MlxRefreshRateHz,
                 tasiSerialPort = _config.TasiSerialPort,
                 tasiBaudRate = _config.TasiBaudRate,
                 tasiPollIntervalSeconds = _config.TasiPollIntervalSeconds
@@ -362,6 +370,35 @@ public sealed class MainForm : Form
         numeric.Maximum = max;
         numeric.Value = value;
         numeric.Dock = DockStyle.Fill;
+    }
+
+    private void ConfigureRefreshRateCombo()
+    {
+        _mlxRefreshRate.Dock = DockStyle.Fill;
+        _mlxRefreshRate.DropDownStyle = ComboBoxStyle.DropDownList;
+        _mlxRefreshRate.Items.Clear();
+        foreach (var value in Mlx90640Constants.SupportedRefreshRatesHz) {
+            _mlxRefreshRate.Items.Add(value.ToString("g"));
+        }
+
+        var configured = Mlx90640Constants.SupportedRefreshRatesHz
+            .FirstOrDefault(value => Math.Abs(value - _config.MlxRefreshRateHz) < 0.001);
+        if (configured <= 0) {
+            configured = Mlx90640Constants.DefaultRefreshRateHz;
+        }
+
+        _mlxRefreshRate.SelectedItem = configured.ToString("g");
+    }
+
+    private double SelectedRefreshRateHz()
+    {
+        var text = _mlxRefreshRate.SelectedItem?.ToString();
+        if (double.TryParse(text, out var value)) {
+            _ = Mlx90640Constants.RefreshRateBitsFromHz(value);
+            return value;
+        }
+
+        return Mlx90640Constants.DefaultRefreshRateHz;
     }
 
     private static void ConfigurePicture(PictureBox picture)

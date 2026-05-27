@@ -18,7 +18,7 @@ import termios
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -35,6 +35,7 @@ DEFAULT_TASI_BAUD = 9600
 ROBOT_THERMAL_OFFSET_C = 44.0
 ROBOT_THERMAL_BIN_NAME = "mlx90640_infrared_thermal.bin"
 ROBOT_THERMAL_LATEST_BIN_NAME = "mlx90640_infrared_thermal_latest.bin"
+EAST8 = timezone(timedelta(hours=8))
 
 I2C_RATE_1M = 0x0B
 I2C_RATE_CODES = {
@@ -61,7 +62,20 @@ STATUS_REGISTER = 0x8000
 CONTROL_REGISTER = 0x800D
 DATA_READY_MASK = 0x0008
 INIT_STATUS_VALUE = 0x0030
+DEFAULT_REFRESH_RATE_HZ = 8.0
+REFRESH_RATE_8HZ = 4
 REFRESH_RATE_32HZ = 6
+REFRESH_RATE_BITS_BY_HZ = {
+    0.5: 0,
+    1.0: 1,
+    2.0: 2,
+    4.0: 3,
+    8.0: 4,
+    16.0: 5,
+    32.0: 6,
+    64.0: 7,
+}
+REFRESH_RATE_HZ_BY_BITS = {bits: hz for hz, bits in REFRESH_RATE_BITS_BY_HZ.items()}
 REFRESH_MASK = 0x0380
 RESOLUTION_18BIT = 2
 RESOLUTION_MASK = 0x0C00
@@ -184,8 +198,22 @@ class SttySerial:
             self._fd = None
 
 
+def east8_now() -> datetime:
+    return datetime.now(EAST8)
+
+
+def to_east8(timestamp: datetime) -> datetime:
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=EAST8)
+    return timestamp.astimezone(EAST8)
+
+
+def east8_iso(timestamp: datetime) -> str:
+    return to_east8(timestamp).isoformat()
+
+
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return east8_now()
 
 
 def hex_bytes(data: bytes | bytearray | Sequence[int], limit: int | None = None) -> str:
@@ -342,6 +370,37 @@ def with_refresh_rate(control: int, rate: int) -> int:
     return (control & ~REFRESH_MASK) | ((rate & 0x07) << 7)
 
 
+def parse_refresh_rate_hz(value: str) -> float:
+    try:
+        refresh_hz = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("MLX90640 refresh rate must be numeric") from exc
+    normalized = normalize_refresh_rate_hz(refresh_hz)
+    if normalized is None:
+        allowed = ", ".join(format_refresh_rate_hz(rate) for rate in REFRESH_RATE_BITS_BY_HZ)
+        raise argparse.ArgumentTypeError(f"MLX90640 refresh rate must be one of: {allowed} Hz")
+    return normalized
+
+
+def normalize_refresh_rate_hz(refresh_hz: float) -> float | None:
+    for allowed in REFRESH_RATE_BITS_BY_HZ:
+        if abs(allowed - refresh_hz) < 0.001:
+            return allowed
+    return None
+
+
+def refresh_rate_bits_from_hz(refresh_hz: float) -> int:
+    normalized = normalize_refresh_rate_hz(refresh_hz)
+    if normalized is None:
+        allowed = ", ".join(format_refresh_rate_hz(rate) for rate in REFRESH_RATE_BITS_BY_HZ)
+        raise CliError(f"MLX90640 refresh rate must be one of: {allowed} Hz")
+    return REFRESH_RATE_BITS_BY_HZ[normalized]
+
+
+def format_refresh_rate_hz(refresh_hz: float) -> str:
+    return f"{refresh_hz:g}"
+
+
 def resolution(control: int) -> int:
     return (control >> 10) & 0x03
 
@@ -406,6 +465,52 @@ class MlxRawSubpage:
         return self.frame_data[833]
 
 
+@dataclass
+class I2cEventStats:
+    read_requests: int = 0
+    read_responses: int = 0
+    read_failures: int = 0
+    response_bytes: int = 0
+
+    def record_read_request(self) -> None:
+        self.read_requests += 1
+
+    def record_read_response(self, byte_count: int) -> None:
+        self.read_responses += 1
+        self.response_bytes += byte_count
+
+    def record_read_failure(self) -> None:
+        self.read_failures += 1
+
+    @property
+    def pending_reads(self) -> int:
+        return max(0, self.read_requests - self.read_responses - self.read_failures)
+
+    @property
+    def response_ratio(self) -> float:
+        if self.read_requests <= 0:
+            return 0.0
+        return self.read_responses / self.read_requests
+
+    def as_dict(self) -> dict[str, int | float]:
+        return {
+            "i2cReadRequests": self.read_requests,
+            "i2cReadResponses": self.read_responses,
+            "i2cReadFailures": self.read_failures,
+            "i2cReadPending": self.pending_reads,
+            "i2cResponseBytes": self.response_bytes,
+            "i2cReadResponseRatio": self.response_ratio,
+        }
+
+    def summary_text(self) -> str:
+        return (
+            f"i2c_reads={self.read_requests} "
+            f"i2c_returns={self.read_responses} "
+            f"i2c_failures={self.read_failures} "
+            f"i2c_pending={self.pending_reads}"
+        )
+
+
 @dataclass(frozen=True)
 class MlxFrameSummary:
     timestamp_utc: datetime
@@ -422,6 +527,68 @@ class MlxFrameSummary:
     channel: str = ""
 
 
+class MlxFullFrameGate:
+    """Emit only after both MLX90640 subpages have refreshed."""
+
+    def __init__(self) -> None:
+        self._seen_subpage_mask = 0
+        self._last_subpage = -1
+
+    def should_emit(self, subpage: int) -> bool:
+        subpage &= 1
+        self._seen_subpage_mask |= 1 << subpage
+        emit = self._seen_subpage_mask == 0b11 and subpage != self._last_subpage
+        self._last_subpage = subpage
+        return emit
+
+
+class MlxSubpageTimingStats:
+    def __init__(self, expected_period_s: float) -> None:
+        self.expected_period_s = expected_period_s
+        self.count = 0
+        self.first_s: float | None = None
+        self.last_s: float | None = None
+        self._previous_s: float | None = None
+        self.max_interval_s = 0.0
+        self.long_gap_count = 0
+
+    def observe(self, timestamp_s: float) -> None:
+        if self.first_s is None:
+            self.first_s = timestamp_s
+        if self._previous_s is not None:
+            interval_s = timestamp_s - self._previous_s
+            self.max_interval_s = max(self.max_interval_s, interval_s)
+            if interval_s > self.expected_period_s * 1.5:
+                self.long_gap_count += 1
+        self._previous_s = timestamp_s
+        self.last_s = timestamp_s
+        self.count += 1
+
+    @property
+    def active_seconds(self) -> float:
+        if self.first_s is None or self.last_s is None:
+            return 0.0
+        return max(0.0, self.last_s - self.first_s)
+
+    @property
+    def observed_hz(self) -> float:
+        if self.count < 2:
+            return 0.0
+        active = self.active_seconds
+        if active <= 0:
+            return 0.0
+        return (self.count - 1) / active
+
+    def summary_text(self) -> str:
+        return (
+            f"subpage_active={self.active_seconds:.3f}s "
+            f"subpage_hz={self.observed_hz:.3f} "
+            f"expected_period={self.expected_period_s * 1000.0:.1f}ms "
+            f"max_gap={self.max_interval_s * 1000.0:.1f}ms "
+            f"long_gaps={self.long_gap_count}"
+        )
+
+
 class Usb2UartSerialI2c:
     def __init__(
         self,
@@ -435,6 +602,7 @@ class Usb2UartSerialI2c:
         self.timeout = timeout
         self.debug_wire = debug_wire
         self._serial = None
+        self.i2c_stats = I2cEventStats()
 
     def __enter__(self) -> "Usb2UartSerialI2c":
         try:
@@ -521,16 +689,24 @@ class Usb2UartSerialI2c:
         byte_count: int,
         read_mode: str = DEFAULT_READ_MODE,
     ) -> bytes:
-        if read_mode == "register":
-            command = build_i2c_register_read_command(i2c_address, register, byte_count)
-            return self._write(command, response_len=byte_count, response_timeout=max(self.timeout, byte_count / 20000))
-        if read_mode in ("dll-stop", "dll-restart"):
-            repeated_start = read_mode == "dll-restart"
-            sequence = build_i2c_register_read_sequence(i2c_address, register, byte_count, repeated_start)
-            for command in sequence[:-1]:
-                self._write(command, response_len=0)
-            return self._write(sequence[-1], response_len=byte_count, response_timeout=max(self.timeout, byte_count / 20000))
-        raise CliError(f"Unsupported MLX read mode: {read_mode}")
+        self.i2c_stats.record_read_request()
+        try:
+            if read_mode == "register":
+                command = build_i2c_register_read_command(i2c_address, register, byte_count)
+                response = self._write(command, response_len=byte_count, response_timeout=max(self.timeout, byte_count / 20000))
+            elif read_mode in ("dll-stop", "dll-restart"):
+                repeated_start = read_mode == "dll-restart"
+                sequence = build_i2c_register_read_sequence(i2c_address, register, byte_count, repeated_start)
+                for command in sequence[:-1]:
+                    self._write(command, response_len=0)
+                response = self._write(sequence[-1], response_len=byte_count, response_timeout=max(self.timeout, byte_count / 20000))
+            else:
+                raise CliError(f"Unsupported MLX read mode: {read_mode}")
+        except Exception:
+            self.i2c_stats.record_read_failure()
+            raise
+        self.i2c_stats.record_read_response(len(response))
+        return response
 
     def read_register_words(
         self,
@@ -594,14 +770,18 @@ class Mlx90640Device:
     def read_control(self) -> int:
         return self.bus.read_word(self.address, CONTROL_REGISTER, self.read_mode)
 
-    def set_refresh_32hz(self) -> tuple[int, int]:
+    def set_refresh_rate(self, refresh_rate_hz: float) -> tuple[int, int]:
+        bits = refresh_rate_bits_from_hz(refresh_rate_hz)
         before = self.read_control()
-        after = with_refresh_rate(before, REFRESH_RATE_32HZ)
+        after = with_refresh_rate(before, bits)
         if before != after:
             self.bus.write_word(self.address, CONTROL_REGISTER, after, self.read_mode)
         verify = self.read_control()
-        if refresh_rate(verify) != REFRESH_RATE_32HZ:
-            raise CliError(f"Failed to set MLX90640 refresh to 32 Hz; control=0x{verify:04X}")
+        if refresh_rate(verify) != bits:
+            raise CliError(
+                f"Failed to set MLX90640 refresh to {format_refresh_rate_hz(refresh_rate_hz)} Hz; "
+                f"control=0x{verify:04X}"
+            )
         return before, verify
 
     def set_resolution_18bit(self) -> tuple[int, int]:
@@ -624,11 +804,11 @@ class Mlx90640Device:
             raise CliError(f"Failed to set MLX90640 chess mode; control=0x{verify:04X}")
         return before, verify
 
-    def configure_operating_mode(self) -> dict[str, tuple[int, int]]:
+    def configure_operating_mode(self, refresh_rate_hz: float = DEFAULT_REFRESH_RATE_HZ) -> dict[str, tuple[int, int]]:
         return {
             "chess": self.set_chess_mode(),
             "resolution": self.set_resolution_18bit(),
-            "refresh": self.set_refresh_32hz(),
+            "refresh": self.set_refresh_rate(refresh_rate_hz),
         }
 
     def read_status(self) -> int:
@@ -655,7 +835,7 @@ class Mlx90640Device:
         frame_data = pixels + aux + [control, subpage_from_status(status)]
         if len(frame_data) != FRAME_DATA_WORDS:
             raise CliError(f"Internal frameData length error: {len(frame_data)}")
-        return MlxRawSubpage(utc_now(), status, control, polls, frame_data)
+        return MlxRawSubpage(east8_now(), status, control, polls, frame_data)
 
 
 class MlxNativeCalculator:
@@ -765,6 +945,7 @@ class MlxCaptureWriter:
         self._eeprom_csv_name = f"{self._file_prefix}eeprom.csv" if self.channel else "eeprom.csv"
         self._frame_data_name = f"{self._file_prefix}frameData.u16le" if self.channel else "frameData.u16le"
         self._frame_layout_name = f"{self._file_prefix}frameData.layout.json" if self.channel else "frameData.layout.json"
+        self._i2c_events_name = f"{self._file_prefix}i2c_events.json" if self.channel else "i2c_events.json"
         self._temperature_name = f"{self._file_prefix}to.f32le" if self.channel else "to.f32le"
         self._temperature_layout_name = f"{self._file_prefix}to.layout.json" if self.channel else "to.layout.json"
         if self.channel:
@@ -781,7 +962,7 @@ class MlxCaptureWriter:
         metadata = dict(metadata)
         extra_raw_files = dict(metadata.pop("rawFiles", {}))
         session = {
-            "createdUtc": utc_now().isoformat(),
+            "createdEast8": east8_now().isoformat(),
             "rawFiles": {**self.file_entries(), **extra_raw_files},
             **metadata,
         }
@@ -804,7 +985,7 @@ class MlxCaptureWriter:
 
         self._subpages_csv.writerow(
             [
-                "timestamp_utc",
+                "timestamp_east8",
                 "subpage",
                 "status_register_hex",
                 "control_register_hex",
@@ -815,7 +996,7 @@ class MlxCaptureWriter:
         )
         self._frames_csv.writerow(
             [
-                "timestamp_utc",
+                "timestamp_east8",
                 "subpage",
                 "to_offset_bytes",
                 "robot_thermal_u8_offset_bytes",
@@ -835,6 +1016,7 @@ class MlxCaptureWriter:
             "eepromCsv": f"raw/{self._eeprom_csv_name}",
             "frameDataU16Le": f"raw/{self._frame_data_name}",
             "frameDataLayoutJson": f"raw/{self._frame_layout_name}",
+            "i2cEventsJson": f"raw/{self._i2c_events_name}",
             "temperatureF32Le": f"temp/{self._temperature_name}",
             "temperatureLayoutJson": f"temp/{self._temperature_layout_name}",
             "robotThermalU8Bin": f"temp/{self._robot_thermal_name}",
@@ -967,7 +1149,7 @@ class MlxCaptureWriter:
         self._frame_data_bin.flush()
         self._subpages_csv.writerow(
             [
-                raw.timestamp_utc.isoformat(),
+                east8_iso(raw.timestamp_utc),
                 raw.subpage,
                 f"0x{raw.status:04X}",
                 f"0x{raw.control:04X}",
@@ -979,6 +1161,14 @@ class MlxCaptureWriter:
         self._subpages_csv_file.flush()
         return offset
 
+    def write_i2c_stats(self, stats: I2cEventStats) -> None:
+        payload = {
+            "createdEast8": east8_now().isoformat(),
+            "channel": self.channel or None,
+            **stats.as_dict(),
+        }
+        (self.raw_dir / self._i2c_events_name).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
     def write_frame(self, timestamp_utc: datetime, subpage: int, ta: float, temperature: Sequence[float]) -> MlxFrameSummary:
         robot_bytes = temperatures_to_robot_thermal_bytes(temperature)
         offset = self._to_bin.tell()
@@ -988,10 +1178,10 @@ class MlxCaptureWriter:
         self._robot_thermal_bin.write(robot_bytes)
         self._robot_thermal_bin.flush()
         self._robot_thermal_latest_path.write_bytes(robot_bytes)
-        summary = summarize_frame(timestamp_utc, subpage, offset, ta, temperature, robot_offset, len(robot_bytes), self.channel)
+        summary = summarize_frame(to_east8(timestamp_utc), subpage, offset, ta, temperature, robot_offset, len(robot_bytes), self.channel)
         self._frames_csv.writerow(
             [
-                summary.timestamp_utc.isoformat(),
+                east8_iso(summary.timestamp_utc),
                 summary.subpage,
                 summary.to_offset_bytes,
                 summary.robot_thermal_u8_offset_bytes,
@@ -1191,6 +1381,12 @@ def add_common_mlx_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stretch", type=int, default=DEFAULT_I2C_STRETCH, help="I2C clock stretch cycles")
     parser.add_argument("--read-chunk-words", type=int, default=DEFAULT_MLX_READ_CHUNK_WORDS, help="MLX register read chunk size in words")
     parser.add_argument("--read-mode", choices=READ_MODES, default=DEFAULT_READ_MODE, help="MLX register read path")
+    parser.add_argument(
+        "--refresh-rate-hz",
+        type=parse_refresh_rate_hz,
+        default=DEFAULT_REFRESH_RATE_HZ,
+        help="MLX90640 refresh rate Hz: 0.5, 1, 2, 4, 8, 16, 32, or 64; default: 8",
+    )
     parser.add_argument("--startup-delay", type=float, default=DEFAULT_STARTUP_DELAY_SECONDS, help="Delay after I2C setup before first MLX access")
     parser.add_argument("--timeout", type=float, default=2.0, help="Serial read/write timeout seconds")
     parser.add_argument("--debug-wire", action="store_true", help="Print raw serial protocol commands and responses")
@@ -1218,14 +1414,14 @@ def cmd_check_mlx(args: argparse.Namespace) -> int:
         ensure_mlx_eeprom_looks_valid(eeprom)
 
         control_before = mlx.read_control()
-        config_steps = mlx.configure_operating_mode()
+        config_steps = mlx.configure_operating_mode(args.refresh_rate_hz)
         status = mlx.read_status()
         print(f"Control before: 0x{control_before:04X}")
         for name, (before, verify) in config_steps.items():
             print(f"{name.capitalize():<12}: 0x{before:04X} -> 0x{verify:04X}")
         print(
             f"Control final:  0x{config_steps['refresh'][1]:04X}; "
-            f"refresh bits={refresh_rate(config_steps['refresh'][1])}; "
+            f"refresh={format_refresh_rate_hz(args.refresh_rate_hz)}Hz bits={refresh_rate(config_steps['refresh'][1])}; "
             f"resolution={resolution(config_steps['refresh'][1])}; "
             f"chess={(config_steps['refresh'][1] & CHESS_MODE_MASK) != 0}"
         )
@@ -1248,7 +1444,9 @@ def cmd_capture_mlx(args: argparse.Namespace) -> int:
         "mlxReadChunkWords": args.read_chunk_words,
         "mlxReadMode": args.read_mode,
         "mlxStartupDelaySeconds": args.startup_delay,
-        "refreshRateHz": 32,
+        "refreshRateHz": args.refresh_rate_hz,
+        "mlxRefreshRateUnit": "subpages_per_second",
+        "mlxFramePolicy": "strict_full_frame_after_both_subpages",
         "adcResolution": "18-bit",
         "mode": "chess",
         "emissivity": args.emissivity,
@@ -1261,7 +1459,7 @@ def cmd_capture_mlx(args: argparse.Namespace) -> int:
         time.sleep(max(0.0, args.startup_delay))
         eeprom = mlx.read_eeprom()
         ensure_mlx_eeprom_looks_valid(eeprom)
-        control_verify = mlx.configure_operating_mode()["refresh"][1]
+        control_verify = mlx.configure_operating_mode(args.refresh_rate_hz)["refresh"][1]
 
         with MlxNativeCalculator(native_path) as calc:
             rc = calc.extract_parameters(eeprom)
@@ -1277,32 +1475,43 @@ def cmd_capture_mlx(args: argparse.Namespace) -> int:
                 frames_written = 0
                 subpages = 0
                 last_rate_print = start
+                full_frame_gate = MlxFullFrameGate()
+                timing_stats = MlxSubpageTimingStats(1.0 / args.refresh_rate_hz)
 
-                while True:
-                    if deadline is not None and time.monotonic() >= deadline:
-                        break
-                    if args.frames and frames_written >= args.frames:
-                        break
+                try:
+                    while True:
+                        if deadline is not None and time.monotonic() >= deadline:
+                            break
+                        if args.frames and frames_written >= args.frames:
+                            break
 
-                    raw = mlx.read_subpage(args.poll_interval, args.max_polls)
-                    writer.write_subpage(raw)
-                    subpages += 1
-                    subpage, ta, temperature = calc.calculate(raw.frame_data, args.emissivity)
-                    summary = writer.write_frame(raw.timestamp_utc, subpage, ta, temperature)
-                    frames_written += 1
+                        raw = mlx.read_subpage(args.poll_interval, args.max_polls)
+                        timing_stats.observe(time.monotonic())
+                        writer.write_subpage(raw)
+                        subpages += 1
+                        subpage, ta, temperature = calc.calculate(raw.frame_data, args.emissivity)
+                        if not full_frame_gate.should_emit(subpage):
+                            continue
+                        summary = writer.write_frame(raw.timestamp_utc, subpage, ta, temperature)
+                        frames_written += 1
 
-                    now = time.monotonic()
-                    if args.print_every <= 1 or frames_written % args.print_every == 0 or now - last_rate_print >= 1.0:
-                        elapsed = max(now - start, 1e-6)
-                        print(
-                            f"frame={frames_written} subpage={summary.subpage} "
-                            f"fps={frames_written / elapsed:.2f} polls={raw.polls} "
-                            f"Ta={summary.ta_c:.2f}C min={summary.min_c:.2f}C "
-                            f"avg={summary.avg_c:.2f}C max={summary.max_c:.2f}C center={summary.center_c:.2f}C"
-                        )
-                        last_rate_print = now
-
-                print(f"Stopped. frames={frames_written}, subpages={subpages}, output={writer.session_dir}")
+                        now = time.monotonic()
+                        if args.print_every <= 1 or frames_written % args.print_every == 0 or now - last_rate_print >= 1.0:
+                            elapsed = max(now - start, 1e-6)
+                            print(
+                                f"full_frame={frames_written} subpage={summary.subpage} "
+                                f"full_fps={frames_written / elapsed:.2f} subpages={subpages} polls={raw.polls} "
+                                f"{bus.i2c_stats.summary_text()} "
+                                f"Ta={summary.ta_c:.2f}C min={summary.min_c:.2f}C "
+                                f"avg={summary.avg_c:.2f}C max={summary.max_c:.2f}C center={summary.center_c:.2f}C"
+                            )
+                            last_rate_print = now
+                finally:
+                    writer.write_i2c_stats(bus.i2c_stats)
+                print(
+                    f"Stopped. full_frames={frames_written}, subpages={subpages}, "
+                    f"{timing_stats.summary_text()}, {bus.i2c_stats.summary_text()}, output={writer.session_dir}"
+                )
     return 0
 
 
@@ -1525,7 +1734,7 @@ class TasiSerialCaptureWriter:
         self._lock = threading.Lock()
         self._csv.writerow(
             [
-                "timestamp_utc",
+                "timestamp_east8",
                 "raw_offset_bytes",
                 "frame_length",
                 "command",
@@ -1551,6 +1760,7 @@ class TasiSerialCaptureWriter:
         self.close()
 
     def write_frame(self, timestamp_utc: datetime, raw: bytes, parsed: dict[str, object]) -> TasiSerialSample:
+        timestamp_east8 = to_east8(timestamp_utc)
         channels = parsed.get("channels_c")
         channel_values = channels if isinstance(channels, list) else ["", "", "", ""]
         model_value = parsed.get("model")
@@ -1558,7 +1768,7 @@ class TasiSerialCaptureWriter:
         model = int(model_value) if isinstance(model_value, int) else None
         version = float(version_value) if isinstance(version_value, float) else None
         sample = TasiSerialSample(
-            timestamp_utc=timestamp_utc,
+            timestamp_utc=timestamp_east8,
             raw_offset_bytes=0,
             frame_length=len(raw),
             command=int(parsed["command"]),
@@ -1576,7 +1786,7 @@ class TasiSerialCaptureWriter:
             sample.raw_offset_bytes = offset
             self._csv.writerow(
                 [
-                    timestamp_utc.isoformat(),
+                    east8_iso(timestamp_east8),
                     offset,
                     len(raw),
                     f"0x{sample.command:02X}",
@@ -1688,7 +1898,7 @@ class TasiSerialPoller:
                     if raw is None:
                         break
                     parsed = parse_tasi_frame(raw)
-                    sample = self.writer.write_frame(utc_now(), raw, parsed)
+                    sample = self.writer.write_frame(east8_now(), raw, parsed)
                     self._frames += 1
                     with self._lock:
                         self._latest = sample
@@ -1703,7 +1913,7 @@ class JoinedSummaryWriter:
         self._csv_file = (session_dir / "joined_summary.csv").open("w", newline="", encoding="utf-8")
         self._csv = csv.writer(self._csv_file)
         header = [
-            "mlx_timestamp_utc",
+            "mlx_timestamp_east8",
             "mlx_subpage",
             "mlx_to_offset_bytes",
             "mlx_robot_thermal_u8_offset_bytes",
@@ -1712,7 +1922,7 @@ class JoinedSummaryWriter:
             "mlx_max_c",
             "mlx_avg_c",
             "mlx_center_c",
-            "tasi_timestamp_utc",
+            "tasi_timestamp_east8",
             "tasi_age_ms",
             "tasi_channel1_c",
             "tasi_channel2_c",
@@ -1737,7 +1947,7 @@ class JoinedSummaryWriter:
     def write(self, mlx: MlxFrameSummary, tasi: TasiSerialSample | None) -> None:
         if tasi is not None and tasi.channels_c is not None:
             age_ms = (mlx.timestamp_utc - tasi.timestamp_utc).total_seconds() * 1000.0
-            tasi_timestamp = tasi.timestamp_utc.isoformat()
+            tasi_timestamp = east8_iso(tasi.timestamp_utc)
             channels = [f"{value:.6f}" for value in tasi.channels_c]
             tasi_offset = tasi.raw_offset_bytes
             checksum_ok = tasi.checksum_ok
@@ -1748,7 +1958,7 @@ class JoinedSummaryWriter:
             tasi_offset = ""
             checksum_ok = ""
         row = [
-            mlx.timestamp_utc.isoformat(),
+            east8_iso(mlx.timestamp_utc),
             mlx.subpage,
             mlx.to_offset_bytes,
             "" if mlx.robot_thermal_u8_offset_bytes is None else mlx.robot_thermal_u8_offset_bytes,
@@ -1786,6 +1996,7 @@ class MlxChannelCaptureWorker:
         frame_limit: int = 0,
         print_every: int = 32,
         print_lock: threading.Lock | None = None,
+        refresh_rate_hz: float = DEFAULT_REFRESH_RATE_HZ,
     ) -> None:
         self.channel = safe_channel_name(channel)
         self.mlx = mlx
@@ -1800,6 +2011,8 @@ class MlxChannelCaptureWorker:
         self.frame_limit = frame_limit
         self.print_every = max(1, print_every)
         self.print_lock = print_lock or threading.Lock()
+        self.full_frame_gate = MlxFullFrameGate()
+        self.timing_stats = MlxSubpageTimingStats(1.0 / refresh_rate_hz)
         self.frames = 0
         self.subpages = 0
         self._error: BaseException | None = None
@@ -1831,9 +2044,12 @@ class MlxChannelCaptureWorker:
                 self.tasi_poller.check_error()
 
                 raw = self.mlx.read_subpage(self.poll_interval, self.max_polls)
+                self.timing_stats.observe(time.monotonic())
                 self.writer.write_subpage(raw)
                 self.subpages += 1
                 subpage, ta, temperature = self.calc.calculate(raw.frame_data, self.emissivity)
+                if not self.full_frame_gate.should_emit(subpage):
+                    continue
                 summary = self.writer.write_frame(raw.timestamp_utc, subpage, ta, temperature)
                 self.frames += 1
                 latest_tasi = self.tasi_poller.latest()
@@ -1849,8 +2065,9 @@ class MlxChannelCaptureWorker:
                         tasi_text = f"TA612=[{channels}] age={age_ms:.0f}ms"
                     with self.print_lock:
                         print(
-                            f"{self.channel} frame={self.frames} subpage={summary.subpage} "
-                            f"fps={self.frames / elapsed:.2f} polls={raw.polls} "
+                            f"{self.channel} full_frame={self.frames} subpage={summary.subpage} "
+                            f"full_fps={self.frames / elapsed:.2f} subpages={self.subpages} polls={raw.polls} "
+                            f"{self.mlx.bus.i2c_stats.summary_text()} "
                             f"Ta={summary.ta_c:.2f}C avg={summary.avg_c:.2f}C "
                             f"center={summary.center_c:.2f}C {tasi_text}"
                         )
@@ -1868,7 +2085,7 @@ def cmd_capture_tasi_serial(args: argparse.Namespace) -> int:
     csv_path = session_dir / "tasi_serial_frames.csv"
     bin_path = raw_dir / "tasi_serial_frames.bin"
     metadata = {
-        "createdUtc": utc_now().isoformat(),
+        "createdEast8": east8_now().isoformat(),
         "kind": "mac_tasi_serial",
         "port": port,
         "baud": args.baud,
@@ -1901,7 +2118,7 @@ def cmd_capture_tasi_serial(args: argparse.Namespace) -> int:
             writer = csv.writer(csv_file)
             writer.writerow(
                 [
-                    "timestamp_utc",
+                    "timestamp_east8",
                     "raw_offset_bytes",
                     "frame_length",
                     "command",
@@ -1941,7 +2158,7 @@ def cmd_capture_tasi_serial(args: argparse.Namespace) -> int:
                 bin_file.flush()
                 writer.writerow(
                     [
-                        utc_now().isoformat(),
+                        east8_now().isoformat(),
                         offset,
                         len(raw),
                         f"0x{int(parsed['command']):02X}",
@@ -1996,7 +2213,9 @@ def cmd_capture_combined(args: argparse.Namespace) -> int:
         "mlxReadChunkWords": args.read_chunk_words,
         "mlxReadMode": args.read_mode,
         "mlxStartupDelaySeconds": args.startup_delay,
-        "refreshRateHz": 32,
+        "refreshRateHz": args.refresh_rate_hz,
+        "mlxRefreshRateUnit": "subpages_per_second",
+        "mlxFramePolicy": "strict_full_frame_after_both_subpages",
         "adcResolution": "18-bit",
         "mode": "chess",
         "emissivity": args.emissivity,
@@ -2019,7 +2238,7 @@ def cmd_capture_combined(args: argparse.Namespace) -> int:
         time.sleep(max(0.0, args.startup_delay))
         eeprom = mlx.read_eeprom()
         ensure_mlx_eeprom_looks_valid(eeprom)
-        control_verify = mlx.configure_operating_mode()["refresh"][1]
+        control_verify = mlx.configure_operating_mode(args.refresh_rate_hz)["refresh"][1]
 
         with MlxNativeCalculator(native_path) as calc:
             rc = calc.extract_parameters(eeprom)
@@ -2051,43 +2270,53 @@ def cmd_capture_combined(args: argparse.Namespace) -> int:
                             frames_written = 0
                             subpages = 0
                             last_rate_print = start
+                            full_frame_gate = MlxFullFrameGate()
+                            timing_stats = MlxSubpageTimingStats(1.0 / args.refresh_rate_hz)
 
-                            while True:
-                                if deadline is not None and time.monotonic() >= deadline:
-                                    break
-                                if args.frames and frames_written >= args.frames:
-                                    break
-                                tasi_poller.check_error()
+                            try:
+                                while True:
+                                    if deadline is not None and time.monotonic() >= deadline:
+                                        break
+                                    if args.frames and frames_written >= args.frames:
+                                        break
+                                    tasi_poller.check_error()
 
-                                raw = mlx.read_subpage(args.poll_interval, args.max_polls)
-                                mlx_writer.write_subpage(raw)
-                                subpages += 1
-                                subpage, ta, temperature = calc.calculate(raw.frame_data, args.emissivity)
-                                summary = mlx_writer.write_frame(raw.timestamp_utc, subpage, ta, temperature)
-                                frames_written += 1
-                                latest_tasi = tasi_poller.latest()
-                                joined_writer.write(summary, latest_tasi)
+                                    raw = mlx.read_subpage(args.poll_interval, args.max_polls)
+                                    timing_stats.observe(time.monotonic())
+                                    mlx_writer.write_subpage(raw)
+                                    subpages += 1
+                                    subpage, ta, temperature = calc.calculate(raw.frame_data, args.emissivity)
+                                    if not full_frame_gate.should_emit(subpage):
+                                        continue
+                                    summary = mlx_writer.write_frame(raw.timestamp_utc, subpage, ta, temperature)
+                                    frames_written += 1
+                                    latest_tasi = tasi_poller.latest()
+                                    joined_writer.write(summary, latest_tasi)
 
-                                now = time.monotonic()
-                                if args.print_every <= 1 or frames_written % args.print_every == 0 or now - last_rate_print >= 1.0:
-                                    elapsed = max(now - start, 1e-6)
-                                    tasi_text = "TA612=none"
-                                    if latest_tasi and latest_tasi.channels_c:
-                                        age_ms = (summary.timestamp_utc - latest_tasi.timestamp_utc).total_seconds() * 1000.0
-                                        channels = " ".join(f"{value:.1f}C" for value in latest_tasi.channels_c)
-                                        tasi_text = f"TA612=[{channels}] age={age_ms:.0f}ms"
-                                    print(
-                                        f"frame={frames_written} subpage={summary.subpage} "
-                                        f"fps={frames_written / elapsed:.2f} polls={raw.polls} "
-                                        f"MLX Ta={summary.ta_c:.2f}C avg={summary.avg_c:.2f}C "
-                                        f"center={summary.center_c:.2f}C {tasi_text}"
-                                    )
-                                    last_rate_print = now
+                                    now = time.monotonic()
+                                    if args.print_every <= 1 or frames_written % args.print_every == 0 or now - last_rate_print >= 1.0:
+                                        elapsed = max(now - start, 1e-6)
+                                        tasi_text = "TA612=none"
+                                        if latest_tasi and latest_tasi.channels_c:
+                                            age_ms = (summary.timestamp_utc - latest_tasi.timestamp_utc).total_seconds() * 1000.0
+                                            channels = " ".join(f"{value:.1f}C" for value in latest_tasi.channels_c)
+                                            tasi_text = f"TA612=[{channels}] age={age_ms:.0f}ms"
+                                        print(
+                                            f"full_frame={frames_written} subpage={summary.subpage} "
+                                            f"full_fps={frames_written / elapsed:.2f} subpages={subpages} polls={raw.polls} "
+                                            f"{bus.i2c_stats.summary_text()} "
+                                            f"MLX Ta={summary.ta_c:.2f}C avg={summary.avg_c:.2f}C "
+                                            f"center={summary.center_c:.2f}C {tasi_text}"
+                                        )
+                                        last_rate_print = now
+                            finally:
+                                mlx_writer.write_i2c_stats(bus.i2c_stats)
 
                             tasi_poller.check_error()
                             print(
-                                f"Stopped. mlx_frames={frames_written}, mlx_subpages={subpages}, "
-                                f"tasi_frames={tasi_poller.frames}, output={mlx_writer.session_dir}"
+                                f"Stopped. mlx_full_frames={frames_written}, mlx_subpages={subpages}, "
+                                f"{timing_stats.summary_text()}, {bus.i2c_stats.summary_text()}, tasi_frames={tasi_poller.frames}, "
+                                f"output={mlx_writer.session_dir}"
                             )
     return 0
 
@@ -2120,7 +2349,7 @@ def cmd_capture_dual_combined(args: argparse.Namespace) -> int:
             time.sleep(max(0.0, args.startup_delay))
             eeprom = mlx.read_eeprom()
             ensure_mlx_eeprom_looks_valid(eeprom)
-            control_verify = mlx.configure_operating_mode()["refresh"][1]
+            control_verify = mlx.configure_operating_mode(args.refresh_rate_hz)["refresh"][1]
             calc = stack.enter_context(MlxNativeCalculator(native_path))
             rc = calc.extract_parameters(eeprom)
             if rc != 0:
@@ -2142,6 +2371,7 @@ def cmd_capture_dual_combined(args: argparse.Namespace) -> int:
                     "port": port,
                     "uid": uid.hex(),
                     "control": control_verify,
+                    "bus": bus,
                     "mlx": mlx,
                     "calc": calc,
                     "writer": writer,
@@ -2158,7 +2388,7 @@ def cmd_capture_dual_combined(args: argparse.Namespace) -> int:
             raw_files.update(prefix_dict_keys(str(item["channel"]), item["files"]))
 
         metadata = {
-            "createdUtc": utc_now().isoformat(),
+            "createdEast8": east8_now().isoformat(),
             "kind": "mac_dual_mlx_tasi",
             "mlxAddress": args.address,
             "mlxBaud": args.mlx_baud,
@@ -2169,7 +2399,9 @@ def cmd_capture_dual_combined(args: argparse.Namespace) -> int:
             "mlxReadChunkWords": args.read_chunk_words,
             "mlxReadMode": args.read_mode,
             "mlxStartupDelaySeconds": args.startup_delay,
-            "refreshRateHz": 32,
+            "refreshRateHz": args.refresh_rate_hz,
+            "mlxRefreshRateUnit": "subpages_per_second",
+            "mlxFramePolicy": "strict_full_frame_after_both_subpages",
             "adcResolution": "18-bit",
             "mode": "chess",
             "emissivity": args.emissivity,
@@ -2223,6 +2455,7 @@ def cmd_capture_dual_combined(args: argparse.Namespace) -> int:
                             frame_limit=args.frames,
                             print_every=args.print_every,
                             print_lock=print_lock,
+                            refresh_rate_hz=args.refresh_rate_hz,
                         )
                         for item in prepared
                     ]
@@ -2251,12 +2484,16 @@ def cmd_capture_dual_combined(args: argparse.Namespace) -> int:
                         join_timeout = max(2.0, args.mlx_timeout + args.max_polls * args.poll_interval + 1.0)
                         for worker in workers:
                             worker.join(timeout=join_timeout)
+                        for item in prepared:
+                            item["writer"].write_i2c_stats(item["bus"].i2c_stats)
                     tasi_poller.check_error()
                     for worker in workers:
                         worker.check_error()
                     elapsed = max(time.monotonic() - start, 1e-6)
                     summary_text = ", ".join(
-                        f"{worker.channel}: frames={worker.frames} subpages={worker.subpages} fps={worker.frames / elapsed:.2f}"
+                        f"{worker.channel}: full_frames={worker.frames} subpages={worker.subpages} "
+                        f"full_fps={worker.frames / elapsed:.2f} {worker.timing_stats.summary_text()} "
+                        f"{worker.mlx.bus.i2c_stats.summary_text()}"
                         for worker in workers
                     )
                     print(f"Stopped. {summary_text}, tasi_frames={tasi_poller.frames}, output={session_dir}")
@@ -2320,7 +2557,7 @@ def cmd_capture_tasi_raw(args: argparse.Namespace) -> int:
     csv_path = session_dir / "tasi_raw_reports.csv"
     bin_path = raw_dir / "tasi_hid_reports.bin"
     metadata = {
-        "createdUtc": utc_now().isoformat(),
+        "createdEast8": east8_now().isoformat(),
         "kind": "mac_tasi_raw",
         "path": args.path,
         "vid": args.vid,
@@ -2334,7 +2571,7 @@ def cmd_capture_tasi_raw(args: argparse.Namespace) -> int:
     try:
         with csv_path.open("w", newline="", encoding="utf-8") as csv_file, bin_path.open("wb") as bin_file:
             writer = csv.writer(csv_file)
-            writer.writerow(["timestamp_utc", "raw_offset_bytes", "report_length", "raw_hex", "parse_status"])
+            writer.writerow(["timestamp_east8", "raw_offset_bytes", "report_length", "raw_hex", "parse_status"])
             print(f"TA612 raw capture directory: {session_dir}")
             start = time.monotonic()
             count = 0
@@ -2349,7 +2586,7 @@ def cmd_capture_tasi_raw(args: argparse.Namespace) -> int:
                 bin_file.write(struct.pack("<I", len(raw)))
                 bin_file.write(raw)
                 bin_file.flush()
-                writer.writerow([utc_now().isoformat(), offset, len(raw), raw.hex(), "raw_hid_unparsed"])
+                writer.writerow([east8_now().isoformat(), offset, len(raw), raw.hex(), "raw_hid_unparsed"])
                 csv_file.flush()
                 count += 1
                 print(f"report={count} len={len(raw)} offset={offset} hex={hex_bytes(raw, limit=32)}")
@@ -2426,14 +2663,14 @@ def iter_tasi_reports_from_tshark_csv(path: Path, min_len: int, max_len: int) ->
             if len(raw) < min_len or (max_len and len(raw) > max_len):
                 continue
             timestamp_epoch = csv_first_present(row, ("frame.time_epoch", "time_epoch", "timestamp_epoch"))
-            timestamp = csv_first_present(row, ("timestamp_utc", "timestamp", "time"))
+            timestamp = csv_first_present(row, ("timestamp_east8", "timestamp_utc", "timestamp", "time"))
             if timestamp_epoch:
                 try:
-                    timestamp = datetime.fromtimestamp(float(timestamp_epoch), timezone.utc).isoformat()
+                    timestamp = datetime.fromtimestamp(float(timestamp_epoch), timezone.utc).astimezone(EAST8).isoformat()
                 except ValueError:
                     timestamp = timestamp_epoch
             if not timestamp:
-                timestamp = utc_now().isoformat()
+                timestamp = east8_now().isoformat()
             endpoint = csv_first_present(row, ("usb.endpoint_address", "usb.endpoint_number", "endpoint"))
             direction = csv_first_present(row, ("direction", "usb.endpoint_direction"))
             if not direction:
@@ -2451,7 +2688,7 @@ def iter_tasi_reports_from_hex_text(path: Path, min_len: int, max_len: int) -> I
                 raw = parse_hex_payload(match.group(0))
                 if len(raw) < min_len or (max_len and len(raw) > max_len):
                     continue
-                yield TasiRawReport(utc_now().isoformat(), raw, f"{path.name}:{line_number}")
+                yield TasiRawReport(east8_now().isoformat(), raw, f"{path.name}:{line_number}")
 
 
 def iter_tasi_reports_from_input(path: Path, input_format: str, min_len: int, max_len: int) -> Iterable[TasiRawReport]:
@@ -2498,7 +2735,7 @@ def cmd_import_tasi_capture(args: argparse.Namespace) -> int:
     csv_path = session_dir / "tasi_raw_reports.csv"
     bin_path = raw_dir / "tasi_hid_reports.bin"
     metadata = {
-        "createdUtc": utc_now().isoformat(),
+        "createdEast8": east8_now().isoformat(),
         "kind": "mac_tasi_imported_raw",
         "input": str(input_path),
         "inputFormat": args.format,
@@ -2513,7 +2750,7 @@ def cmd_import_tasi_capture(args: argparse.Namespace) -> int:
         writer = csv.writer(csv_file)
         writer.writerow(
             [
-                "timestamp_utc",
+                "timestamp_east8",
                 "raw_offset_bytes",
                 "report_length",
                 "direction",
@@ -2620,7 +2857,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_mlx_args(capture_mlx)
     capture_mlx.add_argument("--capture-root", default="captures", help="Output root directory")
     capture_mlx.add_argument("--duration", type=float, default=0.0, help="Capture duration seconds; 0 means until stopped")
-    capture_mlx.add_argument("--frames", type=int, default=0, help="Frame limit; 0 means no limit")
+    capture_mlx.add_argument("--frames", type=int, default=0, help="Strict full-frame limit; 0 means no limit")
     capture_mlx.add_argument("--poll-interval", type=float, default=0.002, help="Data-ready poll interval seconds")
     capture_mlx.add_argument("--max-polls", type=int, default=2000, help="Maximum polls per subpage")
     capture_mlx.add_argument("--emissivity", type=float, default=DEFAULT_EMISSIVITY, help="Object emissivity")
@@ -2640,6 +2877,12 @@ def build_parser() -> argparse.ArgumentParser:
     capture_combined.add_argument("--stretch", type=int, default=DEFAULT_I2C_STRETCH, help="MLX I2C clock stretch cycles")
     capture_combined.add_argument("--read-chunk-words", type=int, default=DEFAULT_MLX_READ_CHUNK_WORDS, help="MLX register read chunk size in words")
     capture_combined.add_argument("--read-mode", choices=READ_MODES, default=DEFAULT_READ_MODE, help="MLX register read path")
+    capture_combined.add_argument(
+        "--refresh-rate-hz",
+        type=parse_refresh_rate_hz,
+        default=DEFAULT_REFRESH_RATE_HZ,
+        help="MLX90640 refresh rate Hz: 0.5, 1, 2, 4, 8, 16, 32, or 64; default: 8",
+    )
     capture_combined.add_argument("--startup-delay", type=float, default=DEFAULT_STARTUP_DELAY_SECONDS, help="Delay after MLX I2C setup")
     capture_combined.add_argument("--poll-interval", type=float, default=0.002, help="MLX data-ready poll interval seconds")
     capture_combined.add_argument("--max-polls", type=int, default=2000, help="Maximum MLX polls per subpage")
@@ -2655,7 +2898,7 @@ def build_parser() -> argparse.ArgumentParser:
     capture_combined.add_argument("--tasi-command-delay", type=float, default=0.1, help="Delay after TA612 stop-first command")
     capture_combined.add_argument("--tasi-accept-alt-header", action="store_true", help="Also accept 0x55AA host-order TA612 header while debugging")
     capture_combined.add_argument("--duration", type=float, default=60.0, help="Capture duration seconds; 0 means until stopped")
-    capture_combined.add_argument("--frames", type=int, default=0, help="MLX frame limit; 0 means no limit")
+    capture_combined.add_argument("--frames", type=int, default=0, help="MLX strict full-frame limit; 0 means no limit")
     capture_combined.add_argument("--capture-root", default="captures", help="Output root directory")
     capture_combined.add_argument("--print-every", type=int, default=32, help="Print every N MLX frames")
     capture_combined.add_argument("--debug-mlx-wire", action="store_true", help="Print raw MLX USB2UART protocol bytes")
@@ -2677,6 +2920,12 @@ def build_parser() -> argparse.ArgumentParser:
     capture_dual_combined.add_argument("--stretch", type=int, default=DEFAULT_I2C_STRETCH, help="MLX I2C clock stretch cycles")
     capture_dual_combined.add_argument("--read-chunk-words", type=int, default=DEFAULT_MLX_READ_CHUNK_WORDS, help="MLX register read chunk size in words")
     capture_dual_combined.add_argument("--read-mode", choices=READ_MODES, default=DEFAULT_READ_MODE, help="MLX register read path")
+    capture_dual_combined.add_argument(
+        "--refresh-rate-hz",
+        type=parse_refresh_rate_hz,
+        default=DEFAULT_REFRESH_RATE_HZ,
+        help="MLX90640 refresh rate Hz: 0.5, 1, 2, 4, 8, 16, 32, or 64; default: 8",
+    )
     capture_dual_combined.add_argument("--startup-delay", type=float, default=DEFAULT_STARTUP_DELAY_SECONDS, help="Delay after MLX I2C setup")
     capture_dual_combined.add_argument("--poll-interval", type=float, default=0.002, help="MLX data-ready poll interval seconds")
     capture_dual_combined.add_argument("--max-polls", type=int, default=2000, help="Maximum MLX polls per subpage")
@@ -2692,7 +2941,7 @@ def build_parser() -> argparse.ArgumentParser:
     capture_dual_combined.add_argument("--tasi-command-delay", type=float, default=0.1, help="Delay after TA612 stop-first command")
     capture_dual_combined.add_argument("--tasi-accept-alt-header", action="store_true", help="Also accept 0x55AA host-order TA612 header while debugging")
     capture_dual_combined.add_argument("--duration", type=float, default=60.0, help="Capture duration seconds; 0 means until stopped")
-    capture_dual_combined.add_argument("--frames", type=int, default=0, help="Per-channel MLX frame limit; 0 means no limit")
+    capture_dual_combined.add_argument("--frames", type=int, default=0, help="Per-channel MLX strict full-frame limit; 0 means no limit")
     capture_dual_combined.add_argument("--capture-root", default="captures", help="Output root directory")
     capture_dual_combined.add_argument("--print-every", type=int, default=32, help="Print every N MLX frames per channel")
     capture_dual_combined.add_argument("--debug-mlx-wire", action="store_true", help="Print raw MLX USB2UART protocol bytes")

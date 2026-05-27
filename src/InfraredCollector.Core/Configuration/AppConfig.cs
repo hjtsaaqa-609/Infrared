@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using InfraredCollector.Core.Mlx;
 
 namespace InfraredCollector.Core.Configuration;
 
@@ -8,6 +9,7 @@ public sealed class AppConfig
     public string CaptureRoot { get; set; } = "captures";
     public double Emissivity { get; set; } = 0.95;
     public byte MlxI2cAddress { get; set; } = 0x33;
+    public double MlxRefreshRateHz { get; set; } = Mlx90640Constants.DefaultRefreshRateHz;
     public int I2cClockStretchLevel { get; set; } = 10000;
     public int MlxReadChunkWords { get; set; } = 64;
     public bool UseRepeatedStartForRegisterRead { get; set; }
