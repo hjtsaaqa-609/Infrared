@@ -219,6 +219,25 @@ temp/right_infrared_thermal_latest.bin
 ```bash
 python3 tools/capture_report_server.py \
   --session captures/mac_dual_mlx_tasi_20260526_113720 \
+  --host 127.0.0.1 \
+  --port 8765
+```
+
+如果需要让局域网内 `10.5.70.229` 访问，同时保留本机 `localhost` 访问，建议绑定所有网卡：
+
+```bash
+python3 tools/capture_report_server.py \
+  --session captures/mac_dual_mlx_tasi_20260526_113720 \
+  --host 0.0.0.0 \
+  --port 8765
+```
+
+如果只想绑定指定网卡，服务端主机必须拥有这个 IP：
+
+```bash
+python3 tools/capture_report_server.py \
+  --session captures/mac_dual_mlx_tasi_20260526_113720 \
+  --host 10.5.70.229 \
   --port 8765
 ```
 
@@ -237,10 +256,13 @@ captures/mac_dual_mlx_tasi_20260526_113720
 页面支持：
 
 - 指定采集数据路径，不需要重启 Web 服务
-- 选择 `物理异常`、`raw P95`、`raw P99` 或不过滤；连续温变趋势建议用 `物理异常`
+- 点击 `浏览` 在 `captures/` 下选择本地采集 session 文件夹；可用 `--browse-root` 修改可浏览根目录
+- 选择 `采集质量`、`温区阈值`、`raw P95`、`raw P99` 或不过滤；连续温变趋势建议用 `采集质量`
 - 选择 MLX/TA612 时间对齐窗口
 - 设置 `2s`、`5s`、`10s` 自动刷新，用于观察正在采集中的实时统计
-- 查看 TA612-4 与左右 MLX90640 全帧 `min / avg / max` 连续趋势、过滤状态和全程统计
+- 查看 TA612 1/2/3/4 路与左右 MLX90640 全帧 `min / avg / max` 连续趋势、过滤状态和全程统计；右侧图例勾选框可切换曲线显示
+
+`采集质量` 不依赖温度数值，而是按 `*_mlx_subpages.csv` 判断 subpage 是否重复、时间间隔是否超过配置刷新周期的 1.5 倍，以及 status/control 是否异常；`温区阈值` 才按 `>200°C`、`<0°C` 或 NaN 摘要做过滤。
 
 如果采集刚开始，某些 CSV 还未创建或还没有足够数据，页面会先显示错误；等待采集程序写入 `left_mlx_frames.csv`、`right_mlx_frames.csv`、`tasi_serial_frames.csv` 后刷新即可。
 
