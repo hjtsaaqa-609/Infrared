@@ -8,6 +8,8 @@ __pycache__/
 # Build outputs
 bin/
 obj/
+dist/
+packages/
 src/**/bin/
 src/**/obj/
 tests/**/bin/
@@ -17,6 +19,7 @@ native/**/x64/
 src/InfraredCollector.Win/NativeBinaries/*.dll
 
 # Capture data and temporary working files
+backups/
 captures/
 tmp/
 test/
@@ -32,9 +35,19 @@ test/
 Debug/
 Release/
 
+# Local ZS-8K MQTT runtime data
+mac_mqtt_zs8k_client/.venv/
+mac_mqtt_zs8k_client/.mqtt_zs8k_client.pid
+mac_mqtt_zs8k_client/__pycache__/
+mac_mqtt_zs8k_client/csv/
+mac_mqtt_zs8k_client/*.csv
+mac_mqtt_zs8k_client/*.jsonl
+mac_mqtt_zs8k_client/*.log
+
 # Old generated packages; current archived package is under archive/
 *.zip
 !archive/*.zip
+docs/HID2IOs_boxed.rar
 
 # Full third-party GUI drops duplicated from vendor/ and docs archives
 docs/EnviromentalTester/
